@@ -10,7 +10,11 @@ Route::get('/', function () {
 Route::get('sms', [SmsController::class, 'index'])
     ->name('sms.index');
 
-Route::post('send-sms', [SmsController::class, 'sendTestSms'])
-    ->name('send.sms');
+// Route to queue an SMS for sending (POST)
+Route::post('/sms/send', [SmsController::class, 'sendSms'])
+    ->name('sms.send');
 
-Route::get('/sms/status/{messageId}', [SmsController::class, 'getSmsStatus'])->name('sms.status');
+// Route to check the status of a sent SMS (GET)
+Route::get('/sms/status/{messageId}', [SmsController::class, 'getSmsStatus'])
+    ->name('sms.status');
+

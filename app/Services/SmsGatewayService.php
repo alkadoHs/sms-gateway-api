@@ -13,10 +13,12 @@ use App\Exceptions\SmsGatewayNetworkException;
 use App\Exceptions\SmsGatewayNotFoundException;
 use App\Exceptions\SmsGatewayRateLimitException;
 use App\Exceptions\SmsGatewayServerException;
+use App\Jobs\SendSmsViaGatewayJob; // Import the job
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str; // For generating UUIDs
 use Throwable; // Import base Throwable
 
 class SmsGatewayService
@@ -29,6 +31,7 @@ class SmsGatewayService
 
     /**
      * SmsGatewayService constructor.
+     * Reads configuration from config/services.php (which should read from .env).
      *
      * @throws \InvalidArgumentException If required configuration is missing.
      */
@@ -39,7 +42,10 @@ class SmsGatewayService
         $this->username = config('services.smsgateway.username');
         $this->password = config('services.smsgateway.password');
         $this->defaultSim = config('services.smsgateway.default_sim') ?: null;
-        $this->deliveryReport = config('services.smsgateway.delivery_report') === null ? null : filter_var(config('services.smsgateway.delivery_report'), FILTER_VALIDATE_BOOLEAN);
+
+        // Handle boolean conversion carefully for null values from env()
+        $deliveryReportConfig = config('services.smsgateway.delivery_report');
+        $this->deliveryReport = $deliveryReportConfig === null ? null : filter_var($deliveryReportConfig, FILTER_VALIDATE_BOOLEAN);
 
         // Check the base URL now
         if (empty($this->baseUrl) || empty($this->username) || empty($this->password)) {
@@ -48,14 +54,62 @@ class SmsGatewayService
     }
 
     /**
-     * Send an SMS message.
+     * Queue an SMS message for sending in the background.
+     * Generates a message ID if one is not provided.
      *
      * @param string|array $phoneNumbers Recipient phone number(s). Use international format (e.g., +1...).
      * @param string $message The message text.
      * @param int|null $simNumber Specify SIM slot (1, 2, etc.), null for default. Overrides config.
      * @param bool|null $withDeliveryReport Request delivery report? Overrides config.
-     * @param string|null $messageId Optional custom message ID.
+     * @param string|null $messageId Optional: Provide your own ID, otherwise one will be generated (UUID). Max 36 chars.
      * @param int|null $priority Optional message priority (-128 to 127). >= 100 bypasses limits/delays.
+     * @return string The message ID (either provided or generated) that was queued.
+     * @throws \InvalidArgumentException If provided messageId exceeds 36 characters.
+     */
+    public function send(
+        string|array $phoneNumbers,
+        string $message,
+        ?int $simNumber = null,
+        ?bool $withDeliveryReport = null,
+        ?string $messageId = null,
+        ?int $priority = null
+    ): string {
+        // Validate provided messageId length if present
+        if ($messageId !== null && strlen($messageId) > 36) {
+            throw new \InvalidArgumentException('Provided message ID cannot exceed 36 characters.');
+        }
+
+        // Generate a UUID if an ID wasn't provided
+        $finalMessageId = $messageId ?? (string) Str::uuid();
+
+        Log::info('SmsGatewayService: Queuing SMS job', ['message_id' => $finalMessageId]);
+
+        // Dispatch the job to the default queue
+        SendSmsViaGatewayJob::dispatch(
+            $phoneNumbers,
+            $message,
+            $simNumber,
+            $withDeliveryReport,
+            $finalMessageId, // Pass the final ID to the job
+            $priority
+        );
+        // ->onQueue('sms'); // Optional: specify a dedicated queue
+        // ->delay(now()->addSeconds(5)); // Optional: delay the job
+
+        return $finalMessageId; // Return the ID immediately
+    }
+
+
+    /**
+     * Send an SMS message Directly (Synchronously).
+     * This method performs the actual HTTP call and is intended to be called by the background job.
+     *
+     * @param string|array $phoneNumbers
+     * @param string $message
+     * @param int|null $simNumber
+     * @param bool|null $withDeliveryReport
+     * @param string|null $messageId // The ID to be sent to the gateway API.
+     * @param int|null $priority
      * @return Response The successful HTTP response object from the gateway (status 202).
      *
      * @throws SmsGatewayBadRequestException
@@ -67,7 +121,7 @@ class SmsGatewayService
      * @throws SmsGatewayNetworkException
      * @throws \Exception For other unexpected errors.
      */
-    public function send(
+    public function sendDirect(
         string|array $phoneNumbers,
         string $message,
         ?int $simNumber = null,
@@ -75,7 +129,8 @@ class SmsGatewayService
         ?string $messageId = null,
         ?int $priority = null
     ): Response {
-        $payload = [
+         // Payload construction logic
+         $payload = [
             'message' => $message,
             'phoneNumbers' => is_array($phoneNumbers) ? $phoneNumbers : [$phoneNumbers],
         ];
@@ -100,7 +155,7 @@ class SmsGatewayService
          }
 
         // Sanitize payload for logging (remove sensitive parts if necessary)
-        $logPayload = $payload; // Adjust if message content is sensitive
+        $logPayload = $payload; // Adjust if message content is sensitive (e.g., mask parts)
 
         $sendUrl = $this->baseUrl . '/messages'; // Construct full URL for sending
 
@@ -111,7 +166,7 @@ class SmsGatewayService
                 ->asJson()
                 ->post($sendUrl, $payload); // Use sendUrl
 
-            // Handle specific statuses
+            // Handle specific statuses using helper methods
             return match ($response->status()) {
                 202 => $this->handleSendSuccess($response, $messageId, $logPayload),
                 400 => $this->handleSendBadRequest($response, $logPayload),
@@ -123,33 +178,36 @@ class SmsGatewayService
             };
 
         } catch (ConnectionException $e) {
-            Log::error('SMS Gateway Connection Exception (Send)', [
+            Log::error('SMS Gateway Connection Exception (SendDirect)', [
                 'message' => $e->getMessage(),
-                'url' => $sendUrl, // Log the specific URL
+                'url' => $sendUrl,
+                'message_id_requested' => $messageId,
             ]);
-            throw new SmsGatewayNetworkException("Connection failed while sending SMS: " . $e->getMessage(), 0, null, $e);
+            // Wrap in our specific network exception
+            throw new SmsGatewayNetworkException("Connection failed while sending SMS directly: " . $e->getMessage(), 0, null, $e);
         } catch (Throwable $e) {
             // Catch other potential exceptions from Http client or elsewhere
-             Log::error('SMS Gateway Generic Exception (Send)', [
+             Log::error('SMS Gateway Generic Exception (SendDirect)', [
                  'message' => $e->getMessage(),
+                 'message_id_requested' => $messageId,
                  'trace' => $e->getTraceAsString() // Be cautious with trace in production logs
              ]);
             // Re-throw as a generic Exception or a specific SmsGatewayException
-            throw new \Exception("Failed to send SMS via gateway: " . $e->getMessage(), 0, $e);
+            throw new \Exception("Failed to send SMS directly via gateway: " . $e->getMessage(), 0, $e);
         }
     }
 
     /**
-     * Get the status of a specific message.
+     * Get the status of a specific message from the gateway.
      *
      * @param string $messageId The ID of the message to check.
-     * @return array The status data returned by the gateway API.
+     * @return array The status data returned by the gateway API (usually includes id, state, recipients, states).
      *
-     * @throws SmsGatewayNotFoundException
-     * @throws SmsGatewayAuthenticationException
-     * @throws SmsGatewayServerException
-     * @throws SmsGatewayClientException
-     * @throws SmsGatewayNetworkException
+     * @throws SmsGatewayNotFoundException If the message ID is not found (404).
+     * @throws SmsGatewayAuthenticationException If credentials are wrong (401).
+     * @throws SmsGatewayServerException For 5xx errors from the gateway.
+     * @throws SmsGatewayClientException For other 4xx errors.
+     * @throws SmsGatewayNetworkException For connection issues.
      * @throws \InvalidArgumentException If messageId is empty.
      * @throws \Exception For other unexpected errors.
      */
@@ -167,7 +225,7 @@ class SmsGatewayService
                 ->acceptJson()
                 ->get($statusUrl);
 
-            // Handle specific statuses for GET request
+            // Handle specific statuses for GET request using helper methods
             return match ($response->status()) {
                 200 => $this->handleStatusSuccess($response, $messageId),
                 401 => $this->handleStatusUnauthorized($response, $messageId),
@@ -203,7 +261,7 @@ class SmsGatewayService
             'gateway_message_id' => $response->json('id'), // ID returned by API
             'state' => $response->json('state'),
         ]);
-        return $response;
+        return $response; // Return the successful response object
     }
 
     protected function handleSendBadRequest(Response $response, array $logPayload): never
@@ -280,7 +338,6 @@ class SmsGatewayService
         Log::info('SMS Gateway Get Status Successful', [
             'status' => $response->status(),
             'message_id' => $messageId,
-            // 'response_body' => $response->json(), // Optional: Log full response if needed
         ]);
         // Return the parsed JSON body, or an empty array if parsing fails
         return $response->json() ?? [];
@@ -295,7 +352,7 @@ class SmsGatewayService
             'response_body' => $response->body(),
         ]);
         $errorMessage = $response->json('message') ?? 'Authentication failed';
-        throw new SmsGatewayAuthenticationException("Authentication failed getting status: {$errorMessage}", $response->status(), $response);
+        throw new SmsGatewayAuthenticationException("Authentication failed getting status for '{$messageId}': {$errorMessage}", $response->status(), $response);
     }
 
      protected function handleStatusNotFound(Response $response, string $messageId): never
@@ -323,10 +380,10 @@ class SmsGatewayService
         $errorMessage = $response->json('message') ?? "Request failed with status {$response->status()}";
 
         if ($response->serverError()) {
-            throw new SmsGatewayServerException("Gateway server error (Get Status): {$errorMessage}", $response->status(), $response);
+            throw new SmsGatewayServerException("Gateway server error getting status for '{$messageId}': {$errorMessage}", $response->status(), $response);
         } else {
             // Other 4xx errors (like 400 if ID format is wrong)
-            throw new SmsGatewayClientException("Gateway client error (Get Status): {$errorMessage}", $response->status(), $response);
+            throw new SmsGatewayClientException("Gateway client error getting status for '{$messageId}': {$errorMessage}", $response->status(), $response);
         }
     }
 }

@@ -20,7 +20,7 @@
             </h1>
 
             <div class="mt-10">
-                <form action="{{ route('send.sms') }}" method="post">
+                <form action="{{ route('sms.send') }}" method="post">
                     @csrf
                     <div class="grid p-2">
                         <label for="phone">Phone number</label>
