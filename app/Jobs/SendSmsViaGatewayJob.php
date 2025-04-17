@@ -2,47 +2,53 @@
 
 namespace App\Jobs;
 
-use App\Services\SmsGatewayService; // Import the service
+use App\Exceptions\SmsGatewayAuthenticationException;
+use App\Exceptions\SmsGatewayBadRequestException;
+use App\Exceptions\SmsGatewayNetworkException;
+use App\Exceptions\SmsGatewayServerException;
+use App\Models\User; // Import User model
+use App\Services\SmsGatewayService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
+// use Illuminate\Contracts\Queue\ShouldBeUnique; // Uncomment if using uniqueness
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
-use Throwable; // Use base Throwable
-
-// Use ShouldBeUnique if you want to prevent duplicate jobs for the same message ID within a certain timeframe
-// use Illuminate\Contracts\Queue\ShouldBeUnique;
+use Throwable;
 
 class SendSmsViaGatewayJob implements ShouldQueue //, ShouldBeUnique // Optional
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     // Public properties are automatically serialized
+    public int $userId; // Store user ID
     public string|array $phoneNumbers;
     public string $message;
     public ?int $simNumber;
     public ?bool $withDeliveryReport;
-    public ?string $messageId; // Use the ID passed to the job
+    public ?string $messageId;
     public ?int $priority;
 
     // Optional: Job configuration
     public int $tries = 3; // Number of times to attempt the job
-    public int $maxExceptions = 2; // Stop retrying after this many exceptions
-    public int $backoff = 60; // Delay (seconds) before retrying: 60s, 120s, 180s...
+    public int $maxExceptions = 2; // Stop retrying after this many exceptions (Laravel default is usually unlimited unless specified)
+    public int $backoff = 60; // Initial delay (seconds) before retrying: 60s, 120s, 180s...
 
 
     /**
      * Create a new job instance.
      *
+     * @param int $userId ID of the user whose settings to use
      * @param string|array $phoneNumbers
      * @param string $message
      * @param int|null $simNumber
      * @param bool|null $withDeliveryReport
-     * @param string|null $messageId // Pass the intended message ID
+     * @param string|null $messageId
      * @param int|null $priority
      */
     public function __construct(
+        int $userId,
         string|array $phoneNumbers,
         string $message,
         ?int $simNumber = null,
@@ -50,11 +56,12 @@ class SendSmsViaGatewayJob implements ShouldQueue //, ShouldBeUnique // Optional
         ?string $messageId = null,
         ?int $priority = null
     ) {
+        $this->userId = $userId; // Store user ID
         $this->phoneNumbers = $phoneNumbers;
         $this->message = $message;
         $this->simNumber = $simNumber;
         $this->withDeliveryReport = $withDeliveryReport;
-        $this->messageId = $messageId; // Store the ID
+        $this->messageId = $messageId;
         $this->priority = $priority;
     }
 
@@ -64,9 +71,9 @@ class SendSmsViaGatewayJob implements ShouldQueue //, ShouldBeUnique // Optional
      */
     // public function uniqueId(): string
     // {
-    //     // Be careful making this too broad. Using messageId might be good if you
-    //     // want to ensure a specific message ID is only queued once.
-    //     return $this->messageId ?? uniqid('sms_send_', true);
+    //     // Using messageId ensures a specific gateway message isn't queued multiple times
+    //     // if the dispatch happens rapidly before the first job runs.
+    //     return $this->messageId ?? ('sms_send_user_' . $this->userId . '_' . uniqid());
     // }
 
     /**
@@ -74,57 +81,108 @@ class SendSmsViaGatewayJob implements ShouldQueue //, ShouldBeUnique // Optional
      */
     // public function uniqueFor(): int
     // {
-    //     return 60 * 5; // 5 minutes
+    //     return 60 * 5; // 5 minutes lock
     // }
 
     /**
      * Execute the job.
+     * Fetches user, retrieves credentials, and calls the direct send method.
      *
-     * Inject the service directly into the handle method.
+     * @param SmsGatewayService $smsGateway Injected by Laravel's service container
      */
     public function handle(SmsGatewayService $smsGateway): void
     {
-        Log::info('SendSmsViaGatewayJob: Starting job', ['message_id' => $this->messageId]);
+        Log::info('SendSmsViaGatewayJob: Starting job', [
+            'user_id' => $this->userId,
+            'message_id' => $this->messageId,
+            'attempt' => $this->attempts() // Log current attempt number
+        ]);
+
+        // Find the user
+        $user = User::find($this->userId);
+        if (!$user) {
+            Log::error('SendSmsViaGatewayJob: User not found.', ['user_id' => $this->userId]);
+            $this->fail(new \Exception("User {$this->userId} not found. Cannot send SMS.")); // Fail permanently
+            return;
+        }
+
+        // Get credentials (handle case where they might be missing or decryption fails)
+        $credentials = null;
+        try {
+            if (!$user->hasSmsGatewayConfigured()) {
+                 Log::error('SendSmsViaGatewayJob: SMS Gateway not configured for user.', ['user_id' => $this->userId]);
+                 $this->fail(new \Exception("SMS Gateway not configured for user {$this->userId}."));
+                 return;
+            }
+            // Use the accessor/mutator for decryption - ensure User model is correct
+             $decryptedPassword = $user->sms_gateway_password;
+             if ($decryptedPassword === null || $user->sms_gateway_url === null || $user->sms_gateway_username === null) {
+                  throw new \Exception('Failed to get/decrypt complete credentials from user model.');
+             }
+             $credentials = [
+                 'url' => $user->sms_gateway_url,
+                 'username' => $user->sms_gateway_username,
+                 'password' => $decryptedPassword,
+             ];
+        } catch (Throwable $e) {
+             Log::critical('SendSmsViaGatewayJob: Failed to get/decrypt credentials for user.', [
+                'user_id' => $this->userId,
+                'exception' => $e->getMessage()
+             ]);
+             $this->fail($e); // Fail permanently if credentials can't be retrieved/decrypted
+             return;
+        }
 
         try {
-            // Call the *actual* sending logic (which is now encapsulated here or
-            // potentially in a separate private method within the service if preferred)
-            // For simplicity, we assume the service's send method now performs the direct HTTP call
-            // Let's create a new method in the service for the direct call
+             // Call the *direct* sending method with the fetched credentials
+             $response = $smsGateway->sendDirect(
+                 $credentials['url'],
+                 $credentials['username'],
+                 $credentials['password'],
+                 $this->phoneNumbers,
+                 $this->message,
+                 $this->simNumber,
+                 $this->withDeliveryReport,
+                 $this->messageId, // Pass the specific message ID
+                 $this->priority
+             );
 
-            // Note: We pass $this->messageId to the *direct* send method now
-            $response = $smsGateway->sendDirect(
-                $this->phoneNumbers,
-                $this->message,
-                $this->simNumber,
-                $this->withDeliveryReport,
-                $this->messageId, // Pass the ID for the API call
-                $this->priority
-            );
-
-            // Log success based on the API response inside the job
-            // The service's handleSendSuccess method already logs.
-             Log::info('SendSmsViaGatewayJob: Successfully sent SMS via gateway', [
-                 'job_message_id' => $this->messageId, // ID passed to job
-                 'gateway_message_id' => $response->json('id'), // ID returned by API
-                 'status' => $response->status()
+            // Logging is handled within sendDirect's success handler
+            Log::info('SendSmsViaGatewayJob: API call successful.', [
+                 'user_id' => $this->userId,
+                 'message_id' => $this->messageId,
+                 'gateway_message_id' => $response->json('id')
              ]);
 
+            // Job finished successfully, no need to do anything else.
+
         } catch (Throwable $e) {
-            // Exceptions are already logged within the service's handle methods
-            Log::error('SendSmsViaGatewayJob: Failed', [
-                'job_message_id' => $this->messageId,
+            // Exceptions are logged within the service's specific handle methods
+            Log::error('SendSmsViaGatewayJob: Failed during API call execution', [
+                'user_id' => $this->userId,
+                'message_id' => $this->messageId,
+                'attempt' => $this->attempts(),
                 'exception_type' => get_class($e),
                 'exception_message' => $e->getMessage(),
             ]);
 
             // Decide if the job should be released back to the queue for retry
-            // based on the type of exception (e.g., retry network errors, fail auth errors)
-            if ($this->shouldRetry($e)) {
+            if ($this->attempts() < $this->tries && $this->shouldRetry($e)) {
                 // release() increases the attempt count and respects backoff
-                $this->release($this->backoff * $this->attempts()); // Exponential backoff example
+                $delay = $this->backoff * $this->attempts(); // Simple exponential backoff
+                 Log::warning("SendSmsViaGatewayJob: Releasing job back to queue.", [
+                    'user_id' => $this->userId,
+                    'message_id' => $this->messageId,
+                    'delay_seconds' => $delay
+                ]);
+                $this->release($delay);
             } else {
-                // fail() marks the job as failed permanently
+                 // Mark as failed permanently if retries exhausted or error is non-retryable
+                 Log::error("SendSmsViaGatewayJob: Failing job permanently.", [
+                    'user_id' => $this->userId,
+                    'message_id' => $this->messageId,
+                    'attempts' => $this->attempts(),
+                 ]);
                 $this->fail($e);
             }
         }
@@ -132,34 +190,44 @@ class SendSmsViaGatewayJob implements ShouldQueue //, ShouldBeUnique // Optional
 
     /**
      * Determine if the job should be retried based on the exception.
+     * Customize this based on the specific exceptions thrown by your service.
      */
     protected function shouldRetry(Throwable $e): bool
     {
-        // Example: Retry network issues or temporary server errors
-        if ($e instanceof \App\Exceptions\SmsGatewayNetworkException || $e instanceof \App\Exceptions\SmsGatewayServerException) {
+        // Example: Retry network issues or temporary server errors (5xx)
+        if ($e instanceof SmsGatewayNetworkException || $e instanceof SmsGatewayServerException) {
             return true;
         }
-        // Example: Don't retry authentication or bad request errors
-        if ($e instanceof \App\Exceptions\SmsGatewayAuthenticationException || $e instanceof \App\Exceptions\SmsGatewayBadRequestException) {
+        // Example: Don't retry authentication (401) or bad request (400, 409) errors
+        if ($e instanceof SmsGatewayAuthenticationException ||
+            $e instanceof SmsGatewayBadRequestException ||
+            $e instanceof SmsGatewayConflictException) {
             return false;
         }
 
-        // Default: Maybe retry other generic exceptions a few times? Adjust as needed.
-        return true;
+        // Example: Potentially retry rate limit errors after a delay (handled by release backoff)
+        if ($e instanceof SmsGatewayRateLimitException) {
+             return true; // relies on backoff delay
+        }
+
+        // Default: Maybe don't retry other client errors or generic exceptions?
+        return false;
     }
 
     /**
-     * Handle a job failure.
+     * Handle a job failure after all retries are exhausted or fail() is called.
      */
     public function failed(Throwable $exception): void
     {
-        // This method is called when the job has failed permanently (retries exhausted or fail() called)
         Log::critical('SendSmsViaGatewayJob: PERMANENTLY FAILED', [
-            'job_message_id' => $this->messageId,
+            'user_id' => $this->userId,
+            'message_id' => $this->messageId,
             'exception_type' => get_class($exception),
             'exception_message' => $exception->getMessage(),
             // 'trace' => $exception->getTraceAsString() // Optional: include trace for critical failures
         ]);
-        // Send notification to admin, etc.
+        // Add logic here: notify admin, mark message as failed in your DB, etc.
+        // Example: Find your internal message record using $this->messageId and update its status
+        // YourInternalMessageModel::where('tracking_id', $this->messageId)->update(['status' => 'failed']);
     }
 }
