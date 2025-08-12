@@ -6,20 +6,20 @@ use App\Exceptions\SmsGatewayAuthenticationException;
 use App\Exceptions\SmsGatewayBadRequestException;
 use App\Exceptions\SmsGatewayClientException;
 use App\Exceptions\SmsGatewayConflictException;
-use App\Exceptions\SmsGatewayException; // Import base exception
+use App\Exceptions\SmsGatewayException;
 use App\Exceptions\SmsGatewayNetworkException;
 use App\Exceptions\SmsGatewayNotFoundException;
 use App\Exceptions\SmsGatewayRateLimitException;
 use App\Exceptions\SmsGatewayServerException;
-use App\Jobs\SendSmsViaGatewayJob; // Import the job
-use App\Models\User; // Import User model
+use App\Jobs\SendSmsViaGatewayJob; 
+use App\Models\User;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
-use Illuminate\Support\Facades\Crypt; // For potential decryption issues logging
+use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Str; // For generating UUIDs
-use Throwable; // Import base Throwable
+use Illuminate\Support\Str;
+use Throwable;
 
 class SmsGatewayService
 {
